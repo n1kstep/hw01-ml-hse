@@ -4,6 +4,8 @@ from typing import List
 from contextlib import asynccontextmanager
 import pandas as pd
 import joblib
+import io
+from fastapi.responses import StreamingResponse
 
 from settings import MODEL_PATH
 from utils import pydantic_model_to_df, extract_car_brands, parse_torque, convert_strs
@@ -58,7 +60,7 @@ async def root():
 
 
 @app.post("/predict_item", response_model=ItemResponse)
-async def predict_item(item: Item) -> float:
+async def predict_item(item: Item):
     df = pydantic_model_to_df(item)
     df = convert_strs(df)
     df[['torque', 'max_torque_rpm']] = df['torque'].apply(parse_torque)
@@ -70,7 +72,7 @@ async def predict_item(item: Item) -> float:
 
 
 @app.post("/predict_items", response_model=ItemsResponses)
-async def predict_items(items: List[Item]) -> List[float]:
+async def predict_items(items: List[Item]):
     df = pd.concat([pydantic_model_to_df(item) for item in items])
     df[['torque', 'max_torque_rpm']] = df['torque'].apply(parse_torque)
     df['name'] = df['name'].apply(extract_car_brands)
@@ -79,3 +81,31 @@ async def predict_items(items: List[Item]) -> List[float]:
     scores = ml_models["ridge"].predict(df)
     responses = [item.model_dump() | {"prediction": float(score)} for item, score in zip(items, scores)]
     return {"responses": responses}
+
+from fastapi import File, UploadFile, HTTPException
+
+
+@app.post("/predict_items_csv")
+def upload(file: UploadFile = File(...)):
+    try:
+        contents = file.file.read()
+        with open(file.filename, 'wb') as f:
+            f.write(contents)
+    except Exception:
+        raise HTTPException(status_code=500, detail='Something went wrong')
+    finally:
+        file.file.close()
+
+    df = pd.read_csv(file.filename)
+    df[['torque', 'max_torque_rpm']] = df['torque'].apply(parse_torque)
+    df['name'] = df['name'].apply(extract_car_brands)
+    df = convert_strs(df)
+    df["prediction"] = ml_models["ridge"].predict(df)
+
+    stream = io.StringIO()
+    df.to_csv(stream, index=False)
+    response = StreamingResponse(iter([stream.getvalue()]), media_type="text/csv")
+    
+    response.headers["Content-Disposition"] = "attachment; filename=result.csv"
+    return response
+
